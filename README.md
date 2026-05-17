@@ -108,7 +108,7 @@ demand-forecasting-engine/
 
 ## 🧪 Live Demo
 
-> *Deployment placeholder — coming soon on Streamlit Cloud.*
+https://demand-forecasting-engine.streamlit.app/
 
 ---
 
