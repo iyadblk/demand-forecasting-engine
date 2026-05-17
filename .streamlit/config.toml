@@ -7,8 +7,12 @@ textColor = "#FAFAFA"
 font = "sans serif"
 
 [server]
-runOnSave = true
-headless = false
+maxUploadSize = 50
+enableXsrfProtection = false
+headless = true
+
+[runner]
+fastReruns = true
 
 [browser]
 gatherUsageStats = false

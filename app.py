@@ -26,10 +26,9 @@ from core.prophet_model import prophet_components
 # Setup
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Demand Forecasting Engine | Iyad Belkadi",
+    page_title="Demand Forecasting Engine",
     page_icon="📦",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 # Inject CSS
@@ -60,14 +59,20 @@ MODEL_COLOR = {
 }
 
 # ---------------------------------------------------------------------------
-# Data load
+# Data load — must complete in seconds on Streamlit Cloud (health check)
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Generating 2 years of demand for all 45 SKUs…", ttl=24*3600)
-def _bootstrap_data():
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def load_data():
+    """Load (or generate-once-then-cache) the 2-year demand + events frames."""
     return load_or_generate()
 
 
-DEMAND_DF, EVENTS_DF = _bootstrap_data()
+try:
+    with st.spinner("Loading warehouse data…"):
+        DEMAND_DF, EVENTS_DF = load_data()
+except Exception as e:
+    st.error(f"Data loading error: {e}")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -217,38 +222,71 @@ st.markdown(
 
 
 # ---------------------------------------------------------------------------
-# Run pipeline for primary SKU
+# LAZY MODELLING — kept Cloud-friendly
+#
+# • Prophet/ARIMA are heavy (~5-10 s per SKU). Fitting all 45 at startup would
+#   blow past the Streamlit Cloud health-check window. We therefore:
+#     1. Run the **full** Prophet+ARIMA+Ensemble pipeline only for the
+#        **selected** primary SKU (cached per (sku_id, horizon) tuple).
+#     2. For the alert dashboard and What-if (which need a forecast for all
+#        45 SKUs), use a fast 7-day moving-average baseline — millisecond
+#        startup, perfectly adequate for stock-depletion projection.
+#     3. The Multi-SKU and Performance tabs already invoke heavier models
+#        lazily, on-demand, inside their tab body, with their own spinners.
 # ---------------------------------------------------------------------------
-with st.spinner(f"Training models for {primary_sku}…"):
-    PRIMARY = run_pipeline(DEMAND_DF, primary_sku, horizon)
+from core.moving_avg import simple_moving_average as _ma_fc
+from core.preprocessor import get_sku_series as _get_series
 
 
-# ---------------------------------------------------------------------------
-# Run lite forecasts for ALL SKUs (used by Tab 1 alert dashboard)
-# ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Generating quick forecasts for alert dashboard…", ttl=3600)
-def _all_lite_forecasts(horizon: int) -> dict[str, pd.DataFrame]:
-    out = {}
-    # Use Prophet-lite for all 45 SKUs
-    for sku in ALL_SKUS:
-        try:
-            out[sku.sku_id] = run_lite(DEMAND_DF, sku.sku_id, horizon)
-        except Exception:
-            # Fallback: 7-day mean
-            from core.moving_avg import simple_moving_average
-            from core.preprocessor import get_sku_series
-            out[sku.sku_id] = simple_moving_average(get_sku_series(DEMAND_DF, sku.sku_id), horizon=horizon)
-    return out
+@st.cache_data(show_spinner=False, ttl=3600)
+def baseline_forecast(sku_id: str, horizon: int) -> pd.DataFrame:
+    """Fast MA forecast for a single SKU — runs in milliseconds."""
+    return _ma_fc(_get_series(DEMAND_DF, sku_id), horizon=horizon)
 
 
-ALL_FORECASTS = _all_lite_forecasts(horizon)
+@st.cache_data(show_spinner=False, ttl=3600)
+def all_baseline_forecasts(horizon: int) -> dict[str, pd.DataFrame]:
+    """Fast MA forecasts for ALL 45 SKUs — used by alerts & What-if."""
+    return {sku.sku_id: baseline_forecast(sku.sku_id, horizon) for sku in ALL_SKUS}
 
-ALERTS_DF = build_alerts_table(
-    ALL_FORECASTS,
-    st.session_state.stocks,
-    lead_time=lead_time,
-    horizon=horizon,
-)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def compute_alerts(horizon: int, lead_time: int, stocks_tuple: tuple) -> pd.DataFrame:
+    """Alerts table — cached on (horizon, lead_time, stock-tuple)."""
+    forecasts = all_baseline_forecasts(horizon)
+    stocks = dict(stocks_tuple)
+    return build_alerts_table(forecasts, stocks, lead_time=lead_time, horizon=horizon)
+
+
+def primary_pipeline(sku_id: str, horizon: int):
+    """Heavy Prophet+ARIMA+Ensemble pipeline — runs lazily, cached per SKU."""
+    return run_pipeline(DEMAND_DF, sku_id, horizon)
+
+
+# ---- Eager-but-fast ALL_FORECASTS (MA-only) -------------------------------
+try:
+    with st.spinner("Building demand baselines…"):
+        ALL_FORECASTS = all_baseline_forecasts(horizon)
+except Exception as e:
+    st.error(f"Forecast baseline error: {e}")
+    st.stop()
+
+# ---- Alerts table (cached) ------------------------------------------------
+try:
+    stocks_tuple = tuple(sorted(st.session_state.stocks.items()))
+    ALERTS_DF = compute_alerts(horizon, int(lead_time), stocks_tuple)
+except Exception as e:
+    st.error(f"Alert computation error: {e}")
+    st.stop()
+
+# ---- Primary SKU full pipeline (Prophet + ARIMA + Ensemble) ---------------
+# Heavy but single-SKU; wrapped so cloud failures don't kill the page.
+try:
+    with st.spinner(f"Training Prophet + ARIMA models for {primary_sku}…"):
+        PRIMARY = primary_pipeline(primary_sku, horizon)
+except Exception as e:
+    st.error(f"Primary model training failed for {primary_sku}: {e}")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
